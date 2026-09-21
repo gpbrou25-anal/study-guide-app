@@ -279,20 +279,52 @@ def build_study_guide(api_key, model, course_name, raw_text):
         f"Raw extracted lecture material follows. Build the complete study guide JSON "
         f"as instructed.\n\n---\n{raw_text}\n---"
     )
-    message = client.messages.create(
+    # Large courses need a lot of output (full explanations + glossary + quiz for every
+    # section) — 16k tokens was truncating mid-JSON on dense material, which is exactly
+    # what raised "invalid JSON" before. Streaming + a much higher ceiling fixes that;
+    # streaming is required by the API for max_tokens this large.
+    with client.messages.stream(
         model=model,
-        max_tokens=16000,
+        max_tokens=64000,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_prompt}],
-    )
-    text = "".join(block.text for block in message.content if block.type == "text")
-    text = text.strip()
+    ) as stream:
+        message = stream.get_final_message()
+
+    raw_response = "".join(block.text for block in message.content if block.type == "text").strip()
+
+    if message.stop_reason == "max_tokens":
+        raise RuntimeError(
+            "The study guide was still too large even at the higher output limit — the "
+            "response got cut off mid-way. Split this course into smaller uploads (e.g. "
+            "by chapter or by half the slides) and build each as its own course."
+        )
+
+    parsed_text = raw_response
     # tolerate the model wrapping in a code fence despite instructions
-    if text.startswith("```"):
-        text = text.split("```")[1]
-        if text.startswith("json"):
-            text = text[4:]
-    return json.loads(text.strip())
+    if parsed_text.startswith("```"):
+        parsed_text = parsed_text.split("```")[1]
+        if parsed_text.startswith("json"):
+            parsed_text = parsed_text[4:]
+    parsed_text = parsed_text.strip()
+
+    try:
+        return json.loads(parsed_text)
+    except json.JSONDecodeError:
+        # Salvage attempt: sometimes a stray sentence slips in before/after the JSON
+        # object despite instructions — grab the outermost {...} and retry once.
+        start, end = parsed_text.find("{"), parsed_text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                return json.loads(parsed_text[start:end + 1])
+            except json.JSONDecodeError:
+                pass
+        st.session_state["last_failed_response"] = raw_response
+        raise json.JSONDecodeError(
+            "Could not parse the AI's response as JSON even after cleanup — see the "
+            "'Show raw response' option below to inspect what came back.",
+            parsed_text, 0,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -377,7 +409,10 @@ if process_clicked:
                     time.sleep(0.5)
                     st.rerun()
             except json.JSONDecodeError:
-                st.error("The AI's response wasn't valid JSON — this can happen on very dense material. Try again, or with fewer files at once.")
+                st.error("The AI's response wasn't valid JSON even after cleanup — this can happen on very dense material. Try again, or split the course into fewer files.")
+                if st.session_state.get("last_failed_response"):
+                    with st.expander("Show raw response (for debugging)"):
+                        st.code(st.session_state["last_failed_response"][:5000])
             except Exception as e:
                 st.error(f"Something went wrong: {e}")
 
