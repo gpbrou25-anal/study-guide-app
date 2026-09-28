@@ -17,6 +17,7 @@ Needs an Anthropic API key (env var ANTHROPIC_API_KEY, or paste it in the sideba
 import io
 import json
 import os
+import re
 import time
 from datetime import datetime
 
@@ -238,6 +239,11 @@ write the guide in French; if in English, write in English; etc.).
 - Generate quiz questions covering the ENTIRE material, roughly 1-3 questions per \
 section depending on its density, all multiple-choice with exactly 4 options, one \
 correct answer, and a one-sentence explanation of why the correct answer is right.
+- For each section, also write a short "recap" with exactly three parts: the single \
+most important thing to keep in mind from that section, a plain-language reason why \
+the concept is actually used in practice (not just what it is), and one concrete, \
+simple, memorable example distinct from the section's other examples — short enough \
+to stick in someone's head.
 
 Respond with ONLY a single JSON object, no other text, no markdown fences, matching \
 exactly this shape:
@@ -250,7 +256,12 @@ exactly this shape:
       "summary": "a thorough, multi-paragraph explanation in plain language (use \\n\\n between paragraphs)",
       "key_points": ["string", "..."],
       "examples": [{"title": "string", "explanation": "string"}],
-      "glossary": [{"term": "string", "definition": "string"}]
+      "glossary": [{"term": "string", "definition": "string"}],
+      "recap": {
+        "keep_in_mind": "string - the one thing to remember from this section",
+        "why_it_matters": "string - why this concept is actually used in practice",
+        "example": "string - one concrete, simple, memorable example"
+      }
     }
   ],
   "quiz": [
@@ -311,20 +322,34 @@ def build_study_guide(api_key, model, course_name, raw_text):
     try:
         return json.loads(parsed_text)
     except json.JSONDecodeError:
-        # Salvage attempt: sometimes a stray sentence slips in before/after the JSON
+        # Salvage attempt 1: sometimes a stray sentence slips in before/after the JSON
         # object despite instructions — grab the outermost {...} and retry once.
         start, end = parsed_text.find("{"), parsed_text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            try:
-                return json.loads(parsed_text[start:end + 1])
-            except json.JSONDecodeError:
-                pass
-        st.session_state["last_failed_response"] = raw_response
-        raise json.JSONDecodeError(
-            "Could not parse the AI's response as JSON even after cleanup — see the "
-            "'Show raw response' option below to inspect what came back.",
-            parsed_text, 0,
-        )
+        candidate = parsed_text[start:end + 1] if start != -1 and end != -1 and end > start else parsed_text
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+
+        # Salvage attempt 2: repair the well-known ways a model's JSON breaks on
+        # dense source material — smart quotes copy-pasted from slides (typographic
+        # quotes aren't valid inside a JSON string), trailing commas before a
+        # closing bracket, and stray control characters — then retry once more.
+        repaired = candidate
+        repaired = repaired.replace("\u201c", '\\"').replace("\u201d", '\\"')
+        repaired = repaired.replace("\u2018", "'").replace("\u2019", "'")
+        repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
+        repaired = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", repaired)
+        try:
+            return json.loads(repaired)
+        except json.JSONDecodeError as e:
+            st.session_state["last_failed_response"] = raw_response
+            raise json.JSONDecodeError(
+                f"Could not parse the AI's response as JSON even after cleanup ({e.msg} at "
+                f"position {e.pos}) — see the 'Show raw response' option below to inspect "
+                "what came back.",
+                parsed_text, 0,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -459,6 +484,12 @@ else:
                     with st.popover("Hard words in this section"):
                         for g in sec["glossary"]:
                             st.markdown(f"**{g.get('term', '')}** — {g.get('definition', '')}")
+                recap = sec.get("recap")
+                if recap:
+                    st.markdown("**Quick recap**")
+                    st.markdown(f"- **Keep in mind:** {recap.get('keep_in_mind', '')}")
+                    st.markdown(f"- **Why it matters:** {recap.get('why_it_matters', '')}")
+                    st.markdown(f"- **Example:** {recap.get('example', '')}")
                 checked = st.checkbox("Mark as studied", value=is_studied, key=f"studied_{course_id}_{i}")
                 if checked != is_studied:
                     set_studied(conn, course_id, i, checked)
